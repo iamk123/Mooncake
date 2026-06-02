@@ -6,20 +6,6 @@ Mooncake PR [kvcache-ai/Mooncake#2214](https://github.com/kvcache-ai/Mooncake/pu
 
 Yuanrong Datasystem 当前也具备分布式 KV cache、worker 本地内存、spill、本地/二级缓存、对象元数据和驱逐流程。为了让外部全局 KV indexer 能感知 Yuanrong 中 KV block 的可用位置，需要在 Yuanrong 中实现类似的 `KvEventPublisher` 能力。
 
-本文档基于以下上下文编写：
-
-- Mooncake PR #2214 的事件格式和实现思路。
-- Yuanrong 仓库 `/Users/kuan/Desktop/yuanrong-datasystem` 当前代码结构。
-- Yuanrong 关键代码路径：
-  - `src/datasystem/worker/object_cache/service/worker_oc_service_publish_impl.cpp`
-  - `src/datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.cpp`
-  - `src/datasystem/worker/object_cache/service/worker_oc_service_delete_impl.cpp`
-  - `src/datasystem/worker/object_cache/worker_oc_eviction_manager.cpp`
-  - `src/datasystem/worker/object_cache/async_send_manager.cpp`
-  - `src/datasystem/common/iam/tenant_auth_manager.cpp`
-  - `src/datasystem/common/util/gflag/common_gflag_define.cpp`
-  - `cmake/external_libs/libzmq.cmake`
-
 ## 2. 目标
 
 实现一个 Yuanrong worker 侧可选开启的 `KvEventPublisher`，用于将 KV cache 对象在 Yuanrong 中的介质状态变化发布给外部 indexer。
