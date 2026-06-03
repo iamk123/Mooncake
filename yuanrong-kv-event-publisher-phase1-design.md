@@ -50,7 +50,7 @@ KvEventPublisher 是观测能力，不是主业务正确性的必要条件。阶
 | worker 总构建 | `src/datasystem/worker/CMakeLists.txt` | worker 已依赖 `worker_object_cache` 和 `common_rpc_zmq` |
 | ZMQ 依赖 | `cmake/external_libs/libzmq.cmake` | ZeroMQ 已是项目现有第三方依赖 |
 | ZMQ 封装 | `src/datasystem/common/rpc/zmq/zmq_context.h`、`zmq_socket_ref.h`、`zmq_message.h` | 可复用 `ZmqContext`、`ZmqSocketRef`、`ZmqMessage`，但需要扩展 `ZmqSocketType::PUB` |
-| 配置 | `src/datasystem/common/util/gflag/common_gflag_define.cpp`、`common_gflags.h`、`common_gflags_validate.cpp` | 新配置应按现有 `DS_DEFINE_*` / `DS_DECLARE_*` / validator 方式加入 |
+| 配置 | `src/datasystem/common/util/gflag/common_gflag_define.cpp`、`common_gflags.h`、`common_gflags_validate.cpp` | 只新增一个 JSON 字符串配置；空字符串表示关闭 publisher |
 | tenant key | `src/datasystem/common/iam/tenant_auth_manager.cpp` | 可复用 `ExtractTenantId()` 和 `ExtractRealObjectKey()` |
 | 线程封装 | `src/datasystem/common/util/thread.h` | 后台线程使用 `datasystem::Thread` 并设置线程名 |
 | 队列 | `src/datasystem/common/util/queue/blocking_queue.h` | 现有 `BlockingQueue` 没有容量上限，阶段 1 不直接复用 |
@@ -115,8 +115,8 @@ struct KvEventConfig {
     // later worker integration may default it from worker address.
     std::string backendId;
 
-    // Tenant id used when namespace URI does not carry a tenant.
-    std::string defaultTenantId{"default"};
+    // Tenant id used when object key does not carry a tenant.
+    std::string tenantId{"default"};
 
     // Hash namespace salt in the event envelope. Empty string is encoded as null.
     std::string additionalSalt;
@@ -130,8 +130,9 @@ struct KvEventConfig {
     // Data parallel rank in the event envelope and payload wrapper.
     uint32_t dpRank{0};
 
-    // Whether to emit vLLM/SGLang compatibility fields:
+    // Whether to emit vLLM/SGLang legacy compatibility fields:
     // type, block_hashes, parent_block_hash.
+    // This only affects extra event fields and does not change the ZMQ protocol.
     bool emitLegacyCompatFields{true};
 
     // Bounded pending-event queue capacity. Additional events are dropped.
@@ -146,7 +147,10 @@ struct KvEventConfig {
 - 使用 Yuanrong C++ 命名风格，字段用 lowerCamelCase。
 - `backendId` 在阶段 1 只从配置传入。后续 worker 接入时可由 `worker_address` 兜底。
 - `blockSize=0` 时，payload 中 `block_size` 编码为 `null`。
-- `emitLegacyCompatFields=true` 时输出 `type`、`block_hashes`、`parent_block_hash`。
+- `emitLegacyCompatFields` 默认 `true`，与 Mooncake PR #2214 保持一致。
+- `emitLegacyCompatFields=true` 时额外输出 legacy 兼容字段：`type`、`block_hashes`、`parent_block_hash`。
+- `emitLegacyCompatFields=false` 时只输出标准字段，不输出上述 legacy 字段。
+- `emitLegacyCompatFields` 只影响 event object 中的附加字段，不影响 publisher 是否启动、不影响内部队列、不影响 ZMQ 三帧协议。
 - batch size 使用 cpp 内部常量 `kMaxBatchSize`，与 Mooncake 保持一致，阶段 1 不暴露到 `KvEventConfig`。
 - ZMQ SNDHWM 使用 ZMQ 默认行为，阶段 1 不暴露到 `KvEventConfig`。
 - shutdown drain timeout 不作为配置项，阶段 1 按 Mooncake 风格在析构中尽力 drain 已入队事件。
@@ -166,8 +170,8 @@ public:
 
     bool Enabled() const;
 
-    void PublishStored(const std::string &namespaceUri, const std::string &medium);
-    void PublishRemoved(const std::string &namespaceUri, const std::string &medium);
+    void PublishStored(const std::string &objectKey, const std::string &medium);
+    void PublishRemoved(const std::string &objectKey, const std::string &medium);
 
     struct Stats {
         uint64_t publishedBatches{0};
@@ -182,14 +186,14 @@ public:
         std::string realObjectKey;
         uint64_t seqHash{0};
     };
-    static std::optional<ParsedKey> ParseKey(const std::string &namespaceUri,
-                                             const std::string &defaultTenantId);
+    static std::optional<ParsedKey> ParseKey(const std::string &objectKey,
+                                             const std::string &tenantId);
 
 private:
     enum class EventKind { STORED, REMOVED };
     struct PendingEvent {
         EventKind kind;
-        std::string namespaceUri;
+        std::string objectKey;
         std::string medium;
     };
 
@@ -243,12 +247,12 @@ std::atomic<bool> stop_{false};
 热路径伪代码：
 
 ```cpp
-void KvEventPublisher::PublishStored(const std::string &namespaceUri, const std::string &medium)
+void KvEventPublisher::PublishStored(const std::string &objectKey, const std::string &medium)
 {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::STORED, namespaceUri, medium});
+    Enqueue(PendingEvent{EventKind::STORED, objectKey, medium});
 }
 
 void KvEventPublisher::Enqueue(PendingEvent event)
@@ -269,36 +273,66 @@ void KvEventPublisher::Enqueue(PendingEvent event)
 
 ## 6. 配置设计
 
-阶段 1 新增 gflags：
+阶段 1 只新增一个 gflag：
 
 ```cpp
-DS_DEFINE_bool(enable_kv_events, false, "Enable RFC #1527 KV event publisher over ZMQ.");
-DS_DEFINE_string(kv_events_bind_endpoint, "", "ZMQ PUB bind endpoint for KV events.");
-DS_DEFINE_string(kv_events_model_name, "", "Model name in KV event envelope.");
-DS_DEFINE_string(kv_events_backend_id, "", "Backend identity in KV event envelope.");
-DS_DEFINE_string(kv_events_tenant_id, "default", "Default tenant id for KV events.");
-DS_DEFINE_string(kv_events_additional_salt, "", "Hash namespace salt in KV event envelope.");
-DS_DEFINE_string(kv_events_lora_name, "", "LoRA name in KV event envelope.");
-DS_DEFINE_uint32(kv_events_block_size, 0, "KV block size; 0 encodes null.");
-DS_DEFINE_uint32(kv_events_dp_rank, 0, "Data parallel rank in KV events.");
-DS_DEFINE_bool(kv_events_emit_legacy_compat, true, "Emit vLLM/SGLang compatibility fields.");
-DS_DEFINE_uint32(kv_events_queue_capacity, 65536, "Bounded KV event queue capacity.");
+DS_DEFINE_string(kv_events_config, "", "KV event publisher JSON config. Empty means disabled.");
 ```
 
-在 `common_gflags.h` 中声明这些 flags。
+在 `common_gflags.h` 中声明这个 flag。
 
-Validator：
+语义：
 
-- `kv_events_queue_capacity > 0`
-- `kv_events_bind_endpoint` 不在全局 validator 强制非空，因为 disabled 状态下可以为空；构造函数在 `enable_kv_events=true` 时检查。
+- `kv_events_config == ""`：不启用 KvEventPublisher，`KvEventConfig.enabled=false`。
+- `kv_events_config != ""`：按 JSON 解析配置，`KvEventConfig.enabled=true`。
+- JSON 字段使用 Mooncake 配置里的 snake_case 名称，解析后映射到 Yuanrong `KvEventConfig` 的 lowerCamel 字段。
 
-配置构造函数建议放在后续 worker 接入阶段实现，例如：
+JSON 示例：
+
+```json
+{
+  "bind_endpoint": "tcp://0.0.0.0:5557",
+  "model_name": "llama-3.1-8b",
+  "backend_id": "datasystem-worker-10.0.0.1:31501",
+  "tenant_id": "default",
+  "additional_salt": "",
+  "lora_name": "",
+  "block_size": 64,
+  "dp_rank": 0,
+  "emit_legacy_compat_fields": true,
+  "queue_capacity": 65536
+}
+```
+
+字段映射：
+
+| JSON 字段 | `KvEventConfig` 字段 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `bind_endpoint` | `bindEndpoint` | 无 | 非空 JSON 配置中必填 |
+| `model_name` | `modelName` | `""` | 空字符串编码为 `null` |
+| `backend_id` | `backendId` | 无 | 非空 JSON 配置中必填 |
+| `tenant_id` | `tenantId` | `"default"` | 无法从 namespace URI 提取 tenant 时使用 |
+| `additional_salt` | `additionalSalt` | `""` | 空字符串编码为 `null` |
+| `lora_name` | `loraName` | `""` | 空字符串编码为 `null` |
+| `block_size` | `blockSize` | `0` | 0 编码为 `null` |
+| `dp_rank` | `dpRank` | `0` | data parallel rank |
+| `emit_legacy_compat_fields` | `emitLegacyCompatFields` | `true` | 是否额外输出 vLLM/SGLang legacy 兼容字段 |
+| `queue_capacity` | `queueCapacity` | `65536` | 有界队列容量，必须大于 0 |
+
+配置构造函数建议：
 
 ```cpp
-KvEventConfig BuildKvEventConfigFromFlags();
+KvEventConfig BuildKvEventConfigFromJsonString(const std::string &jsonConfig);
 ```
 
-阶段 1 可以先在测试中手动构造 `KvEventConfig`，生产代码只提供结构体和 publisher。
+解析规则：
+
+- 输入为空字符串时返回 disabled config。
+- 输入非空但不是合法 JSON 时记录 ERROR，返回 disabled config。
+- `bind_endpoint` 或 `backend_id` 缺失/为空时记录 ERROR，返回 disabled config。
+- `queue_capacity == 0` 时记录 ERROR，返回 disabled config。
+- 未出现的可选字段使用上表默认值。
+- 不新增额外字段；阶段 1 只解析上表字段。
 
 ## 7. ZMQ 设计
 
@@ -424,7 +458,21 @@ payload 逻辑结构：
 
 ## 9. Key Parser 详细设计
 
-输入：`namespaceUri`。
+输入：`objectKey`，即 Yuanrong worker object table 中看到的 key。
+
+vLLM Ascend 的 Yuanrong backend 通过 `Backend.put(keys, addrs, sizes)` 写入 Yuanrong。当前路径是：
+
+```text
+ChunkedTokenDatabase.process_tokens()
+  -> PoolKey / LayerPoolKey
+  -> key.to_string()
+  -> YuanrongBackend.put()
+  -> YuanrongHelper.normalize_keys()
+  -> HeteroClient.mset_d2h()
+  -> Yuanrong worker tenant namespace
+```
+
+因此 publisher 看到的 key 不是直接来自 vLLM 的 `block_hashes`，而是 Yuanrong tenant namespace 包裹后的、可能经过 vLLM Ascend `normalize_keys()` 处理的 object key。
 
 输出：
 
@@ -438,32 +486,56 @@ struct ParsedKey {
 
 流程：
 
-1. `tenantId = TenantAuthManager::ExtractTenantId(namespaceUri)`。
-2. 如果 `tenantId.empty()`，使用 `defaultTenantId`。
-3. `realObjectKey = TenantAuthManager::ExtractRealObjectKey(namespaceUri)`。
-4. 解析 `realObjectKey`：
+1. `parsedTenantId = TenantAuthManager::ExtractTenantId(objectKey)`。
+2. 如果 `parsedTenantId.empty()`，使用配置中的 `tenantId`。
+3. `realObjectKey = TenantAuthManager::ExtractRealObjectKey(objectKey)`。
+4. 如果 `realObjectKey` 末尾匹配 `__` + 16 位十六进制字符，先去掉该后缀。这个后缀来自 vLLM Ascend `YuanrongHelper.normalize_keys()`，用于标识被替换或截断过的原始 key。
+5. 从 `realObjectKey` 中提取候选 hash 字符串：
+   - 如果 `realObjectKey` 本身是纯十进制 `u64` 或 `0x` / `0X` 前缀十六进制 `u64`，候选值就是整个 `realObjectKey`。
+   - 如果是 vLLM Ascend `PoolKey.to_string()`，格式为：
+
+     ```text
+     <model>@pcp<pcp>@dcp<dcp>@head_or_tp_rank:<rank>@pp_rank:<pp>@group:<group>@cache_role:<role>@cache_family:<family>@<chunk_hash>
+     ```
+
+     候选值是最后一个 `@` 后的 `<chunk_hash>`。
+   - 如果是 vLLM Ascend `LayerPoolKey.to_string()`，格式为：
+
+     ```text
+     <model>@pcp<pcp>@dcp<dcp>@head_or_tp_rank:<rank>@group:<group>@cache_role:<role>@cache_family:<family>@<chunk_hash>@<layer_id>
+     ```
+
+     候选值是倒数第二个 `@` 后的 `<chunk_hash>`；最后一个字段是 layer id，不参与 `seq_hash`。
+6. 解析候选 hash 字符串：
    - 如果以 `0x` 或 `0X` 开头，用 base 16。
-   - 否则用 base 10。
-   - 使用 `std::stoull` 并检查 `idx == realObjectKey.size()`。
+   - 如果候选值来自整个 `realObjectKey` 且不带 `0x`，只按 base 10 解析。
+   - 如果候选值来自 vLLM Ascend `PoolKey` / `LayerPoolKey` 的 `<chunk_hash>` 字段，且不带 `0x`、全部是十六进制字符、长度不超过 16，可以按 base 16 解析。这是为了兼容 vLLM Ascend 对 bytes block hash 调用 `h.hex()` 后形成的短 hex 字符串。
+   - 使用 `std::stoull` 并检查 `idx == candidate.size()`。
    - 捕获异常，失败返回 `std::nullopt`。
 
 注意：
 
 - Yuanrong 的 `ExtractTenantId()` 对无分隔符 key 会返回 `DEFAULT_TENANT_ID`。阶段 1 不额外改变该行为。
-- `realObjectKey` 不允许带后缀、前缀、冒号或其他分隔符。
+- Yuanrong tenant namespace 分隔符是 `$`，不是 `/`。例如 `tenant-a$12345`。
+- vLLM Ascend `normalize_keys()` 不会把原始 key 原样保留下来：非法字符会被替换为 `_`，并追加 `__<sha256(original)[:16]>`；如果 key 超过 Yuanrong 255 字符限制，还会截断前缀。
+- 如果截断导致 `<chunk_hash>` 丢失，publisher 无法可靠恢复 `seq_hash`，该事件应跳过并增加 `skippedUnparsedKeys`。
+- 如果候选 hash 是超过 64 bit 的长 hex 字符串，阶段 1 不截断、不 hash 二次转换，直接跳过。是否取低 64 位或使用其他转换，需要和 vLLM/Dynamo 的 rolling hash 语义单独对齐。
 - `seqHash=0` 不是非法值；只要 key 是合法 u64 就允许。
 
-测试用例：
+解析示例：
 
-| 输入 | 期望 |
-| --- | --- |
-| `12345` | tenant=`default`，real=`12345`，hash=12345 |
-| `tenant-a/12345` | tenant=`tenant-a`，real=`12345`，hash=12345 |
-| `tenant-a/0x2a` | tenant=`tenant-a`，real=`0x2a`，hash=42 |
-| `tenant-a/0XFF` | hash=255 |
-| `tenant-a/not-a-hash` | parse failed |
-| `tenant-a/123abc` | parse failed |
-| 空字符串 | parse failed |
+| 输入 namespace URI | 中间结果 | 期望 |
+| --- | --- | --- |
+| `12345` | tenant=`default`，candidate=`12345` | `seqHash=12345` |
+| `tenant-a$12345` | tenant=`tenant-a`，real=`12345`，candidate=`12345` | `seqHash=12345` |
+| `tenant-a$0x2a` | tenant=`tenant-a`，real=`0x2a`，candidate=`0x2a` | `seqHash=42` |
+| `tenant-a$llama@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@group:0@cache_role:kv@cache_family:default@0x75bcd15` | vLLM Ascend `PoolKey`，candidate=`0x75bcd15` | `seqHash=123456789` |
+| `tenant-a$llama@pcp0@dcp0@head_or_tp_rank:0@group:0@cache_role:kv@cache_family:default@0x75bcd15@17` | vLLM Ascend `LayerPoolKey`，candidate=`0x75bcd15`，layer=`17` | `seqHash=123456789` |
+| `tenant-a$Qwen_Qwen3@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@group:0@cache_role:kv@cache_family:default@0x2a__0123456789abcdef` | 先去掉 normalize suffix，candidate=`0x2a` | `seqHash=42` |
+| `tenant-a$llama@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@group:0@cache_role:kv@cache_family:default@6830` | candidate=`6830`，无 `0x` 但是短 hex | `seqHash=26672` |
+| `tenant-a$not-a-hash` | candidate=`not-a-hash` | parse failed |
+| `tenant-a$123abc` | 整个 `realObjectKey` 是候选值，不启用 PoolKey 短 hex 规则 | parse failed |
+| 空字符串 | 无 candidate | parse failed |
 
 ## 10. 后台线程流程
 
@@ -668,7 +740,10 @@ common_rpc_zmq
 
 - decimal key。
 - hex key。
-- tenant namespace。
+- Yuanrong `$` tenant namespace。
+- vLLM Ascend `PoolKey.to_string()`。
+- vLLM Ascend `LayerPoolKey.to_string()`。
+- vLLM Ascend `normalize_keys()` 后缀 `__<16 hex>`。
 - invalid key。
 - empty key。
 - overflow key。
@@ -759,21 +834,21 @@ EXPECT_EQ(publisher.GetStats().droppedEvents, 0);
 阶段 2/3 接生命周期时，只应使用以下 public API：
 
 ```cpp
-publisher->PublishStored(namespaceUri, "cpu");
-publisher->PublishRemoved(namespaceUri, "cpu");
-publisher->PublishStored(namespaceUri, "disk");
-publisher->PublishRemoved(namespaceUri, "disk");
+publisher->PublishStored(objectKey, "cpu");
+publisher->PublishRemoved(objectKey, "cpu");
+publisher->PublishStored(objectKey, "disk");
+publisher->PublishRemoved(objectKey, "disk");
 ```
 
 为了后续避免在各业务路径判断 publisher 是否为空，可提供一个轻量 helper：
 
 ```cpp
 inline void PublishKvStored(KvEventPublisher *publisher,
-                            const std::string &namespaceUri,
+                            const std::string &objectKey,
                             const std::string &medium)
 {
     if (publisher != nullptr) {
-        publisher->PublishStored(namespaceUri, medium);
+        publisher->PublishStored(objectKey, medium);
     }
 }
 ```

@@ -405,8 +405,8 @@ if (hadCpuCopy) {
 
 建议使用真实 publisher + ZMQ SUB：
 
-1. 启动 worker，开启 `enable_kv_events=true`。
-2. SUB 连接 `kv_events_bind_endpoint`。
+1. 启动 worker，设置非空 `kv_events_config`。
+2. SUB 连接 JSON 中的 `bind_endpoint`。
 3. Set 一个可解析 rolling hash key。
 4. 验证收到：
 
