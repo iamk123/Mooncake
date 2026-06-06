@@ -2,6 +2,8 @@
 
 ## 1. 背景
 
+[MindIE-PyMotor](https://gitcode.com/Ascend/MindIE-PyMotor) 是华为昇腾推出的面向大语言模型（LLM）PD分离推理场景的分布式推理服务化框架。在 PD分离推理场景中，需要通过 KV Cache [亲和性调度](https://gitcode.com/Ascend/MindIE-PyMotor/blob/810a081da13e772e9bc97b08a5a10a0eb9394395/docs/zh/developer_guide/kv_cache_affinity/kv_cache_affinity_design.md)将请求路由到 KV Cache 命中率最高的 Prefill 实例，以复用已有的 KV Cache，减少重复计算。为此，PyMotor 依赖外部 KV Indexer 维护全局 KV Cache 分布索引，而 Indexer 需要实时感知各 worker 上 KV block 的可用状态。
+
 Yuanrong Datasystem 作为 KV cache 后端时，外部全局 KV indexer 需要感知每个 worker 上 KV block 的可用状态。worker 在本地 CPU 内存中新增、删除或释放 KV block 后，应向 indexer 发布事件，indexer 根据事件维护全局索引，并为后续 KV cache 命中、路由和调度提供依据。
 
 本设计在 Yuanrong worker object cache 模块中新增可选的 `KvEventPublisher` 能力。该能力通过 ZMQ PUB 发布 MessagePack 编码的 KV 事件，向外部 indexer 通知 CPU 介质上的 `stored` 和 `removed` 状态变化。
